@@ -1,4 +1,7 @@
+Pillow
+pytesseract
 pandas
 openpyxl
-pytesseract
-opencv-python
+python-docx
+googletrans==4.0.0-rc1
+legacy-cgi

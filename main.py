@@ -1,118 +1,172 @@
+import argparse
 import os
-import re
-import cv2
+import io
+
+from PIL import Image
 import pytesseract
+from googletrans import Translator
 import pandas as pd
+from docx import Document
 
-# --- Configuration ---
-IMAGE_DIR = 'images'
-OUTPUT_FILE = 'output/results.xlsx'
-LANGUAGE = 'amh+eng' # Process Amharic and English
+# Ensure the output directory exists
+OUTPUT_DIR = "output"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# --- Main Processing Logic ---
-
-def preprocess_image(image_path):
+def perform_ocr(image_path: str) -> str:
     """
-    Loads an image and applies basic preprocessing for OCR.
-    - Converts to grayscale
-    - Applies a binary threshold
+    Performs OCR on the given image path and returns the extracted text using Tesseract.
     """
-    try:
-        img = cv2.imread(image_path)
-        if img is None:
-            print(f"Warning: Could not read image file: {image_path}")
-            return None
+    if not os.path.exists(image_path):
+        raise FileNotFoundError(f"Image not found at {image_path}")
+    
+    img = Image.open(image_path)
+    text = pytesseract.image_to_string(img, lang='eng+amh') 
+    return text
+
+def translate_text(text: str, target_language: str) -> str:
+    """
+    Translates the given text to the target language.
+    target_language can be 'en' for English or 'am' for Amharic.
+    """
+    translator = Translator()
+    
+    if target_language == 'en':
+        translated_text = translator.translate(text, dest='en').text
+    elif target_language == 'am':
+        translated_text = translator.translate(text, dest='am').text
+    else:
+        raise ValueError("Target language must be 'en' (English) or 'am' (Amharic).")
+    
+    return translated_text
+
+def is_tabular(text: str, confidence_threshold: float = 0.7) -> bool:
+    """
+    Heuristically determines if the text is tabular or a passage.
+    A simple heuristic: count lines with consistent 'columns' (separated by multiple spaces/tabs).
+    """
+    lines = text.strip().split('\n')
+    
+    if not lines:
+        return False
+
+    # Filter out empty lines or lines that are too short to be meaningful table rows
+    meaningful_lines = [line for line in lines if len(line.strip()) > 5] 
+    if not meaningful_lines:
+        return False
         
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        # A simple binary threshold can be effective for high-contrast, handwritten documents.
-        # The value 150 is a starting point and may need tuning.
-        _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
-        
-        return thresh
-    except Exception as e:
-        print(f"Error preprocessing image {image_path}: {e}")
-        return None
+    column_counts = []
+    for line in meaningful_lines:
+        # Split by multiple spaces or tabs to identify potential columns
+        columns = [col.strip() for col in line.split('  ') if col.strip()] # Split by at least two spaces
+        if not columns: # If splitting by '  ' yields no columns, try splitting by single space
+            columns = [col.strip() for col in line.split(' ') if col.strip()]
+        column_counts.append(len(columns)) # Append the count here
 
-def extract_text_from_image(image):
+    if not column_counts:
+        return False
+
+    # Analyze column counts for consistency
+    from collections import Counter
+    counts_frequency = Counter(column_counts)
+    
+    # Find the most common column count
+    most_common_count, most_common_frequency = counts_frequency.most_common(1)[0]
+    
+    # If the most common column count is 1 or 2 (typical for passages with some minor spacing)
+    # AND its frequency is very high, it's probably a passage.
+    if most_common_count <= 2 and most_common_frequency / len(meaningful_lines) > confidence_threshold:
+        return False # Likely a passage
+
+    # If a significant portion of meaningful lines have more than 2 columns, consider it tabular
+    multi_column_lines = sum(1 for count in column_counts if count > 2)
+    
+    if multi_column_lines / len(meaningful_lines) > confidence_threshold:
+        return True # Likely tabular
+
+    return False # Default to false if no strong indication
+
+def create_spreadsheet(text: str, output_path: str):
     """
-    Uses Tesseract to extract text from a preprocessed image.
-    --psm 4: Assume a single column of text of variable sizes. This is often
-             better for preserving the line-by-line structure of a document.
+    Converts the text into a pandas DataFrame and saves it as an XLSX file.
+    Assumes whitespace-separated columns.
     """
-    try:
-        custom_config = f'-l {LANGUAGE} --psm 4'
-        text = pytesseract.image_to_string(image, config=custom_config)
-        return text
-    except pytesseract.TesseractNotFoundError:
-        print("\n--- TESSERACT NOT FOUND ---")
-        print("Error: `tesseract` is not installed or it's not in your system's PATH.")
-        return None
-    except Exception as e:
-        print(f"Error during OCR extraction: {e}")
-        return None
+    data = []
+    lines = text.strip().split('\n')
+    for line in lines:
+        # Split by any whitespace for robustness
+        row = [item.strip() for item in line.split() if item.strip()]
+        if row: # Only add non-empty rows
+            data.append(row)
+    
+    if not data:
+        print("Warning: No parseable data found for spreadsheet. No file created.")
+        return
+        
+    # Pad rows to ensure they all have the same number of columns for DataFrame creation
+    max_cols = max(len(row) for row in data)
+    padded_data = [row + [''] * (max_cols - len(row)) for row in data]
+    
+    df = pd.DataFrame(padded_data)
+    df.to_excel(output_path, index=False, header=False) # No header for raw data
+    print(f"Spreadsheet saved to {output_path}")
+
+def create_word_document(text: str, output_path: str):
+    """
+    Creates a Word document from the given text.
+    """
+    document = Document()
+    for paragraph in text.split('\n'):
+        if paragraph.strip(): # Add non-empty paragraphs
+            document.add_paragraph(paragraph.strip())
+    document.save(output_path)
+    print(f"Word document saved to {output_path}")
 
 def main():
-    """
-    Main function to orchestrate the OCR process.
-    This version focuses on extracting raw lines of text from each image.
-    """
-    print("Starting document processing...")
+    parser = argparse.ArgumentParser(description="Digitize physical data from images.")
+    parser.add_argument("image_path", help="Path to the input image file.")
+    parser.add_argument("--lang", default="en", choices=["en", "am"], 
+                        help="Target language for output (en for English, am for Amharic). Default is 'en'.")
     
-    if not os.path.isdir(IMAGE_DIR):
-        print(f"Error: Image directory '{IMAGE_DIR}' not found.")
-        return
+    args = parser.parse_args()
 
-    if not os.path.isdir('output'):
-        os.makedirs('output')
+    print(f"Processing image: {args.image_path}")
+    print(f"Target language: {args.lang}")
 
-    image_files = [f for f in os.listdir(IMAGE_DIR) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-    
-    if not image_files:
-        print(f"No images found in the '{IMAGE_DIR}' directory.")
-        return
-
-    all_lines = []
-
-    for image_file in image_files:
-        image_path = os.path.join(IMAGE_DIR, image_file)
-        print(f"\n--- Processing: {image_path} ---")
-        
-        preprocessed_image = preprocess_image(image_path)
-        
-        if preprocessed_image is None:
-            continue
-            
-        raw_text = extract_text_from_image(preprocessed_image)
-        
-        if not raw_text or not raw_text.strip():
-            print("Could not extract text from this image.")
-            continue
-        
-        # Split the raw text into individual lines and filter out empty lines
-        lines = [line.strip() for line in raw_text.split('\n') if line.strip()]
-        
-        print(f"Extracted {len(lines)} lines of text.")
-        
-        for line in lines:
-            all_lines.append({
-                'Source File': image_file,
-                'Extracted Line': line
-            })
-
-    if not all_lines:
-        print("\nNo data was successfully extracted from any image.")
-        return
-
-    # --- Export to Excel ---
-    print(f"\nExporting {len(all_lines)} total lines to {OUTPUT_FILE}...")
-    df = pd.DataFrame(all_lines)
-    
     try:
-        df.to_excel(OUTPUT_FILE, index=False)
-        print(f"Successfully created Excel file at: {OUTPUT_FILE}")
-    except Exception as e:
-        print(f"\n--- PANDAS/EXCEL ERROR ---")
-        print(f"Could not write to Excel file: {e}")
+        # Step 1: Perform OCR
+        print("Performing OCR...")
+        extracted_text = perform_ocr(args.image_path)
+        if not extracted_text.strip():
+            print("No text detected by OCR. Exiting.")
+            return
 
-if __name__ == '__main__':
+        print("\n--- Extracted Text ---")
+        print(extracted_text[:500] + "..." if len(extracted_text) > 500 else extracted_text)
+        print("----------------------\n")
+
+        # Step 2: Translate text
+        print(f"Translating to {args.lang}...")
+        translated_text = translate_text(extracted_text, args.lang)
+        
+        print("\n--- Translated Text ---")
+        print(translated_text[:500] + "..." if len(translated_text) > 500 else translated_text)
+        print("----------------------\n")
+
+        # Step 3: Determine if tabular or passage
+        print("Analyzing text structure...")
+        if is_tabular(translated_text):
+            print("Detected as tabular data.")
+            output_file = os.path.join(OUTPUT_DIR, f"{os.path.basename(args.image_path).split('.')[0]}_output.xlsx")
+            create_spreadsheet(translated_text, output_file)
+        else:
+            print("Detected as passage/document data.")
+            output_file = os.path.join(OUTPUT_DIR, f"{os.path.basename(args.image_path).split('.')[0]}_output.docx")
+            create_word_document(translated_text, output_file)
+
+    except FileNotFoundError as e:
+        print(f"Error: {e}")
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+
+if __name__ == "__main__":
     main()
